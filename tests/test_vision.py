@@ -287,7 +287,7 @@ def test_long_state_keeps_its_head_and_the_images(engines):
         eng = _small_window(vision, 700, strict=False)
         state = "First words stay. " + "filler " * 200 + "Last words go."
         img = [fit_image(decode_image(_b64(320, 320, 4)), 448)]
-        s, _, _ = eng._fit_images(state, img, [render_question(QUESTIONS["signed"]).text])
+        s, _, _, _ = eng._fit_images(state, img, [render_question(QUESTIONS["signed"]).text])
         assert s.count(eng.tok.convert_tokens_to_ids(IMAGE_PAD)) == 100  # the image is whole
         kept = eng.tok.decode(s)
         assert "First words stay." in kept and "Last words go." not in kept
@@ -296,6 +296,82 @@ def test_long_state_keeps_its_head_and_the_images(engines):
                 state, img, [render_question(QUESTIONS["signed"]).text])
     finally:
         vision.model.config.max_length = original
+
+
+def test_concurrent_image_and_text_requests_match_serial(engines):
+    """Vision engine serves mixed image+text requests through FastAPI's threadpool.
+    `_fit_images` once wrote offsets onto the engine too; a concurrent request would
+    overwrite them before `_image_probs` read them back, so the pointer head scored
+    the wrong tokens. Pins that the image path threads offsets per request as the
+    text path does."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    _, vision = engines
+    img = _b64(160, 160, 7)
+    reqs = []
+    for i in range(8):
+        state = f"{STATE} ({i})"
+        if i % 2:
+            reqs.append(SystemOneRequest(state=state, questions=QUESTIONS, images=[img]))
+        else:
+            reqs.append(SystemOneRequest(state=state, questions=QUESTIONS))
+
+    def answers(resp):
+        return {n: a.model_dump() for n, a in resp.answers.items()}
+
+    with torch.inference_mode():
+        serial = [answers(vision.evaluate(r)) for r in reqs]
+
+    # Hold every thread between tokenising and pointing, so they interleave at the
+    # race-prone spot in both the text (_fit) and image (_fit_images) paths.
+    workers = 4
+    barrier = threading.Barrier(workers, timeout=60)
+    broke = threading.Event()
+    # The HF fast tokenizer (Rust) raises "Already borrowed" if two threads reconfigure
+    # truncation on it at once -- orthogonal to the race under test. Serialise just
+    # the tokeniser calls; the barrier still interleaves threads at the race-prone spot.
+    fit_lock = threading.Lock()
+
+    def _trip():
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            broke.set()
+        time.sleep(0.01)
+
+    fit = type(vision)._fit
+    fit_images = type(vision)._fit_images
+
+    def slow_fit(self, *a, **kw):
+        with fit_lock:
+            out = fit(self, *a, **kw)
+        _trip()
+        return out
+
+    def slow_fit_images(self, *a, **kw):
+        with fit_lock:
+            out = fit_images(self, *a, **kw)
+        _trip()
+        return out
+
+    try:
+        VisionEngine._fit = slow_fit  # type: ignore[method-assign]
+        VisionEngine._fit_images = slow_fit_images  # type: ignore[method-assign]
+
+        def run(r):
+            with torch.inference_mode():
+                return answers(vision.evaluate(r))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            concurrent = list(pool.map(run, reqs))
+    finally:
+        VisionEngine._fit = fit  # type: ignore[method-assign]
+        VisionEngine._fit_images = fit_images  # type: ignore[method-assign]
+
+    assert not broke.is_set(), "barrier broke; threads did not interleave at _fit/_fit_images"
+    assert concurrent == serial
 
 
 # ---- engine and API ------------------------------------------------------------------------

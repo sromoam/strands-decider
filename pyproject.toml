@@ -27,7 +27,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only the corpus build uses datasets: `strands-decider data build` and `python -m strands_decider.data.multistep`.
+# The corpus build and multistep converter use datasets:
+# `python -m training.data build` and `python -m training.data.multistep`. Those modules
+# live under training/, not src/, so they ship in the repo, not in the wheel; this extra
+# is here for `pip install -e ".[train]"` from a checkout rather than for Hub consumers.
 train = ["datasets>=2.20"]
 # Image input (`serve --vision`, `ask --image`, docs/vision.md); also needs transformers >= 5.18.
 vision = ["pillow>=10"]
@@ -89,14 +92,16 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["SLF001"]  # tests legitimately assert on internal invariants
+"training/tests/*" = ["SLF001"]
 "evaluation/*" = ["SLF001"]  # the probes read model internals, as the tests do
-"src/strands_decider/data/policy.py" = ["SLF001"]  # attaches _cell/_rule to its own examples for balancing
+"training/data/policy.py" = ["SLF001"]  # attaches _cell/_rule to its own examples for balancing
 "research/scripts/*" = ["RUF001"]  # chart labels intentionally use the × multiplication sign
 
 [tool.mypy]
 # Matches the strict-ish profile used by strands-agents/harness-sdk. Type-check the
-# published surface (`src/strands_decider`) only — the rest of the tree (tests, evaluation,
-# research, training, inference scripts) is deliberately looser.
+# published surface (`src/strands_decider`) and the training package; the rest of the tree
+# (tests, evaluation, research, inference scripts) is deliberately looser. `hatch run
+# lint:check` passes `./src ./training --exclude training/tests` to pin that scope.
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
@@ -130,8 +135,11 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["evaluation"]  # test_hf_export imports multistep_eval
+testpaths = ["tests", "training/tests"]
+# "." so `import training.*` resolves; test_hf_export imports multistep_eval; "tests" and
+# "training/tests" so test_variance (in training/tests) can `from test_checkpoint_load` /
+# `from test_hf_export` (in tests/) regardless of collection order.
+pythonpath = [".", "evaluation", "tests", "training/tests"]
 addopts = "-m 'not distributed'"
 markers = [
     "distributed: launches torchrun worker processes (minutes); run with -m distributed",
@@ -169,7 +177,7 @@ dependencies = [
 ]
 
 [tool.hatch.envs.lint.scripts]
-check = ["ruff check {args:.}", "mypy ./src"]
+check = ["ruff check {args:.}", "mypy ./src ./training --exclude training/tests"]
 
 # Conventional Commits, matching the PR-title gate in
 # .github/workflows/pr-title.yml. Enforced locally by the commit-msg hook in

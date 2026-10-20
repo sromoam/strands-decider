@@ -3,7 +3,7 @@ held-out set, and score old against new on their test halves
 (research/preregistrations/PREREGISTRATION-v19-calmix.md). Score keeps its temperature. Writes the refitted
 temperatures into a copy of the checkpoint, never the original.
 
-    python evaluation/calibrate_mix.py [CHECKPOINT] [COPY]
+    python -m evaluation.calibrate_mix [CHECKPOINT] [COPY]
       (defaults: checkpoints/hobson-2b-v19 checkpoints/hobson-2b-v19-calmix)
 
 The six sets are built by recipe.sh (build, multistep, generated, adequacy); halves are
@@ -15,8 +15,9 @@ import json
 import shutil
 import sys
 
-from strands_decider.data.format import read_jsonl
-from strands_decider.evaluate import (
+from strands_decider.modeling import StrandsDeciderModel
+from training.data.format import read_jsonl
+from training.evaluate import (
     collect_logits,
     fit_temperature_by_kind,
     partition_examples,
@@ -24,7 +25,6 @@ from strands_decider.evaluate import (
     sample_examples,
     summarise,
 )
-from strands_decider.modeling import StrandsDeciderModel
 
 SETS = ["holdout_v5_norule", "multistep_v14_eval", "generated_v16_eval", "generated_v18_eval",
         "adequacy_hs2_eval", "adequacy_gen_eval"]

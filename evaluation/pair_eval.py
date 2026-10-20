@@ -1,6 +1,6 @@
 """Paired evaluations (v20), where rows come in adjacent pairs.
 
-    python evaluation/pair_eval.py CHECKPOINT FILE [FILE ...]
+    python -m evaluation.pair_eval CHECKPOINT FILE [FILE ...]
 
   data/para_pairs_*_eval.jsonl  (original wording, a checked paraphrase), same label:
                                 `same_answer` is paraphrase consistency (v20 prediction 1)
@@ -14,9 +14,9 @@ halves right. Uses the checkpoint's own temperatures and window.
 import json
 import sys
 
-from strands_decider.data.format import read_jsonl
-from strands_decider.evaluate import collect_logits, predictions_from_logits
 from strands_decider.modeling import StrandsDeciderModel
+from training.data.format import read_jsonl
+from training.evaluate import collect_logits, predictions_from_logits
 
 
 def main(argv):

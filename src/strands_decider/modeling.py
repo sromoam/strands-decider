@@ -31,7 +31,7 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 # Slots the head can address. This must match the largest option count the corpus
 # actually contains: slots beyond that never receive a gradient and would ship at
-# their random initialisation. `strands-decider data build --max-options 24` is the matching
+# their random initialisation. `python -m training.data build --max-options 24` is the matching
 # default. Questions with more options are rejected, not silently truncated.
 DEFAULT_NUM_SLOTS = 24
 
@@ -88,7 +88,7 @@ class StrandsDeciderConfig:
     # existing checkpoint keeps loading unchanged.
     head_type: str = "slot"
     pointer_dim: int = 256
-    # Populated after `strands-decider calibrate` runs; 1.0 is a no-op. `temperature` is the
+    # Populated after `python -m training.evaluate calibrate` runs; 1.0 is a no-op. `temperature` is the
     # fallback; `temperature_by_kind` overrides it per primitive where fitted.
     # One global scalar cannot serve all three: noul/choice/score sit at very
     # different accuracies, so a temperature good for one over-softens another.
@@ -635,10 +635,17 @@ class StrandsDeciderModel(nn.Module):
         *,
         device_map: str | None = None,
         attn_implementation: str | None = None,
+        trainable: bool = False,
+        host_embeddings: bool | None = None,
     ) -> StrandsDeciderModel:
+        """Load checkpoint `path` (a local directory or a Hub id) to serve it, or with
+        `trainable` to train it on: the adapter trains, and the attention is the one training
+        uses. `host_embeddings`, when given, replaces the checkpoint's setting."""
         path = checkpoint_dir(path)
         config = StrandsDeciderConfig.from_json(config_path(path))
         config.base_revision = base_revision(path, config)
+        if host_embeddings is not None:
+            config.host_embeddings = host_embeddings
         # Check the checkpoint's own files before the torso loads its 2B weights. Without
         # this check, a checkpoint without its adapter loads and gives other probabilities.
         lora_dir = os.path.join(path, "lora")
@@ -654,14 +661,15 @@ class StrandsDeciderModel(nn.Module):
             ensure_bos(tok)
 
         torso = cls._load_torso(config, device_map, attn_implementation)
-        # load() serves; training builds its torso in from_pretrained_base, unchanged
-        if attn_implementation is None and serving_attn_implementation(torso.config):
+        # serving only: training keeps the attention from_pretrained_base gives it
+        serving = not trainable and attn_implementation is None
+        if serving and serving_attn_implementation(torso.config):
             torso.set_attn_implementation(serving_attn_implementation(torso.config))
 
         if config.use_lora:
             from peft import PeftModel
 
-            torso = PeftModel.from_pretrained(torso, lora_dir, is_trainable=False)
+            torso = PeftModel.from_pretrained(torso, lora_dir, is_trainable=trainable)
 
         # __init__ would re-attach LoRA on top of the adapter we just loaded, so build
         # the module directly and restore the head weights in place.

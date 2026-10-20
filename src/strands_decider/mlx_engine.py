@@ -131,10 +131,11 @@ class MLXEngine(SystemOneEngine):
         self.device = "cpu"
         self._decoder = decoder
         self._cache_owner = cache_owner
-        # One evaluation at a time: `_fit` leaves the request's option offsets on the engine
-        # (`_last_offsets`) for `_option_idx` to read, so two requests in the server's thread
-        # pool would read each other's. The torch engine has the same race (#9).
+        # One evaluation at a time: mlx-lm's lazy arrays belong to the thread that
+        # produced them, and the server runs requests on its thread pool.
         self._lock = threading.Lock()
+        self._prefix_cache_unforkable = False
+        self._tok_lock = threading.Lock()
 
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
         with self._lock:
@@ -173,24 +174,29 @@ class MLXEngine(SystemOneEngine):
             logits = apply_temperature(raw, self._temperatures(kinds))
             return masked_log_softmax(logits, torch.tensor(n_slots)).exp()
 
-    def _option_positions(self, rendered: list[RenderedQuestion] | None, base: int) -> torch.Tensor | None:
+    def _option_positions(
+        self, rendered: list[RenderedQuestion] | None, base: int,
+        offsets: list[list[tuple[int, int]]],
+    ) -> torch.Tensor | None:
         if self.model.config.head_type != "pointer":
             return None
         assert rendered is not None
-        return self._option_idx(rendered, base)
+        return self._option_idx(rendered, base, offsets)
 
     def _slot_probs_batched(
         self, state: list[int], questions: list[list[int]], n_slots: list[int], kinds: list[str],
+        offsets: list[list[tuple[int, int]]],
         rendered: list[RenderedQuestion] | None = None,
     ) -> tuple[torch.Tensor, int]:
         rows = [state + question for question in questions]
         hidden = self._hidden(rows)
         probs = self._probs(hidden, [len(row) - 1 for row in rows],
-                            self._option_positions(rendered, len(state)), n_slots, kinds)
+                            self._option_positions(rendered, len(state), offsets), n_slots, kinds)
         return probs, sum(len(row) for row in rows)
 
     def _slot_probs_shared_prefix(
         self, state: list[int], questions: list[list[int]], n_slots: list[int], kinds: list[str],
+        offsets: list[list[tuple[int, int]]],
         rendered: list[RenderedQuestion] | None = None,
     ) -> tuple[torch.Tensor, int]:
         prefix = make_prompt_cache(self._cache_owner)
@@ -199,7 +205,7 @@ class MLXEngine(SystemOneEngine):
         batch = [type(layer).merge([layer] * len(questions)) for layer in prefix]
         hidden = self._hidden(questions, batch)
         probs = self._probs(hidden, [len(question) - 1 for question in questions],
-                            self._option_positions(rendered, 0), n_slots, kinds)
+                            self._option_positions(rendered, 0, offsets), n_slots, kinds)
         return probs, len(state) + sum(len(question) for question in questions)
 
 

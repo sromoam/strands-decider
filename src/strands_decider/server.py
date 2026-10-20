@@ -7,6 +7,7 @@ Compatibility with the Jev API itself is not verified.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -19,11 +20,14 @@ from .modeling import StrandsDeciderModel
 from .schema import SystemOneRequest, SystemOneResponse
 
 _engine: SystemOneEngine | None = None
-# One engine call at a time. FastAPI dispatches sync handlers on a threadpool, so
-# without this two overlapping requests touch the same GPU and crash MPS with a
-# Metal command-buffer assertion (issue #9). Serialising here is cheap: the engine
-# already saturates the device within a single request.
 _engine_lock = threading.Lock()
+
+
+def _needs_serialisation(device: str) -> bool:
+    """MPS aborts the process with a Metal command-buffer assertion (issue #9) when
+    two overlapping threads hit the same device. CUDA and CPU are thread-safe for
+    inference, and MLX serialises on its own scheduler."""
+    return str(device).startswith("mps")
 
 
 def get_engine() -> SystemOneEngine:
@@ -72,7 +76,10 @@ def create_app(
         model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
         _engine = SystemOneEngine(model, config)
 
+    # SageMaker and AgentCore Runtime call /ping and /invocations; each is the same
+    # handler as the path above it.
     @app.get("/health")
+    @app.get("/ping")
     def health() -> dict:
         eng = get_engine()
         return {
@@ -88,12 +95,16 @@ def create_app(
             "vision": vision,
         }
 
+    guard: contextlib.AbstractContextManager
+    guard = _engine_lock if _needs_serialisation(device) else contextlib.nullcontext()
+
     @app.post("/v1/systemone", response_model=SystemOneResponse)
+    @app.post("/invocations", response_model=SystemOneResponse)
     def systemone(request: SystemOneRequest) -> JSONResponse:
         eng = get_engine()
         started = time.perf_counter()
         try:
-            with _engine_lock:
+            with guard:
                 response = eng.evaluate(request)
         except ValueError as exc:
             # Option count over num_slots, malformed permutation, etc. -- caller error.
