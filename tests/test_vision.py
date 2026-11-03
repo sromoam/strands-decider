@@ -35,13 +35,13 @@ if tuple(int(x) for x in re.findall(r"\d+", transformers.__version__)[:2]) < (5,
 import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from strands_decider.infer import EngineConfig, SystemOneEngine, _option_token_index  # noqa: E402
+from strands_decider.infer import EngineConfig, SystemOneEngine  # noqa: E402
 from strands_decider.modeling import (  # noqa: E402
     StrandsDeciderConfig,
     StrandsDeciderModel,
     masked_log_softmax,
 )
-from strands_decider.prompting import render_question  # noqa: E402
+from strands_decider.prompting import option_token_index, render_question  # noqa: E402
 from strands_decider.schema import (  # noqa: E402
     ChoiceQuestion,
     NoulQuestion,
@@ -62,13 +62,27 @@ from strands_decider.vision import (  # noqa: E402
     render_image_state,
 )
 
-TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
-           "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]
+TARGETS = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_a",
+    "in_proj_b",
+    "out_proj",
+]
 STATE = "Help! My payouts have been failing for 3 days."
 QUESTIONS = {
     "signed": NoulQuestion(instructions="Is the form signed?"),
-    "button": ChoiceQuestion(instructions="Which control next?",
-                             criteria={"submit": "the blue submit button", "cancel": "the grey cancel link"}),
+    "button": ChoiceQuestion(
+        instructions="Which control next?",
+        criteria={"submit": "the blue submit button", "cancel": "the grey cancel link"},
+    ),
     "sharp": ScoreQuestion(instructions="How sharp?", criteria=["blurred", "soft", "sharp"]),
 }
 
@@ -79,7 +93,9 @@ def _tokenizer():
     alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
     vocab = {"<|endoftext|>": 0, **{c: i + 1 for i, c in enumerate(alphabet)}}
     tok = transformers.Qwen3_5Tokenizer(vocab=vocab, merges=[])
-    tok.add_special_tokens({"additional_special_tokens": ["<|vision_start|>", IMAGE_PAD, VISION_END]})
+    tok.add_special_tokens(
+        {"additional_special_tokens": ["<|vision_start|>", IMAGE_PAD, VISION_END]}
+    )
     return tok
 
 
@@ -91,28 +107,56 @@ def base_dir(tmp_path_factory):
     ids = {t: tok.convert_tokens_to_ids(t) for t in ("<|vision_start|>", IMAGE_PAD, VISION_END)}
     cfg = transformers.Qwen3_5Config(
         text_config={
-            "hidden_size": 64, "num_hidden_layers": 4, "intermediate_size": 128, "head_dim": 64,
-            "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": len(tok),
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "intermediate_size": 128,
+            "head_dim": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "vocab_size": len(tok),
             "layer_types": ["linear_attention"] * 3 + ["full_attention"],
-            "linear_num_key_heads": 4, "linear_num_value_heads": 4,
-            "linear_key_head_dim": 16, "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4,
-            "attn_output_gate": True, "tie_word_embeddings": True, "mtp_num_hidden_layers": 0,
-            "rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
-                                "mrope_section": [3, 3, 2], "mrope_interleaved": True},
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "attn_output_gate": True,
+            "tie_word_embeddings": True,
+            "mtp_num_hidden_layers": 0,
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": 1e7,
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [3, 3, 2],
+                "mrope_interleaved": True,
+            },
         },
-        vision_config={"depth": 2, "hidden_size": 64, "num_heads": 4, "intermediate_size": 128,
-                       "out_hidden_size": 64, "patch_size": 16, "spatial_merge_size": 2,
-                       "temporal_patch_size": 2, "num_position_embeddings": 2304},
-        image_token_id=ids[IMAGE_PAD], vision_start_token_id=ids["<|vision_start|>"],
-        vision_end_token_id=ids[VISION_END], tie_word_embeddings=True,
+        vision_config={
+            "depth": 2,
+            "hidden_size": 64,
+            "num_heads": 4,
+            "intermediate_size": 128,
+            "out_hidden_size": 64,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "num_position_embeddings": 2304,
+        },
+        image_token_id=ids[IMAGE_PAD],
+        vision_start_token_id=ids["<|vision_start|>"],
+        vision_end_token_id=ids[VISION_END],
+        tie_word_embeddings=True,
     )
     torch.manual_seed(0)
     transformers.Qwen3_5ForConditionalGeneration(cfg).save_pretrained(d)
     tok.save_pretrained(d)
     transformers.Qwen2VLImageProcessorPil(
-        patch_size=16, temporal_patch_size=2, merge_size=2,
+        patch_size=16,
+        temporal_patch_size=2,
+        merge_size=2,
         size={"shortest_edge": 65536, "longest_edge": 16777216},
-        image_mean=[0.5] * 3, image_std=[0.5] * 3,
+        image_mean=[0.5] * 3,
+        image_std=[0.5] * 3,
     ).save_pretrained(d)
     return str(d)
 
@@ -120,9 +164,14 @@ def base_dir(tmp_path_factory):
 @pytest.fixture(scope="module")
 def ckpt(base_dir, tmp_path_factory):
     """A text Strands Decider checkpoint on that base, with a non-trivial adapter."""
-    cfg = StrandsDeciderConfig(base_model=base_dir, head_type="pointer", pointer_dim=32,
-                               torch_dtype="float32", max_length=1024, lora_targets=TARGETS,
-                               temperature_by_kind={"noul": 0.9, "choice": 0.7})
+    cfg = StrandsDeciderConfig(
+        base_model=base_dir,
+        pointer_dim=32,
+        torch_dtype="float32",
+        max_length=1024,
+        lora_targets=TARGETS,
+        temperature_by_kind={"noul": 0.9, "choice": 0.7},
+    )
     model = StrandsDeciderModel.from_pretrained_base(cfg)
     with torch.no_grad():
         for n, p in model.torso.named_parameters():
@@ -156,9 +205,14 @@ def _b64(w: int, h: int, seed: int) -> str:
 
 def test_image_state_layout():
     two = render_image_state("two pages", 2)
-    assert two == ("<state>\n<|vision_start|><|image_pad|><|vision_end|>\n"
-                   "<|vision_start|><|image_pad|><|vision_end|>\ntwo pages\n</state>\n")
-    assert render_image_state("", 1) == "<state>\n<|vision_start|><|image_pad|><|vision_end|>\n</state>\n"
+    assert two == (
+        "<state>\n<|vision_start|><|image_pad|><|vision_end|>\n"
+        "<|vision_start|><|image_pad|><|vision_end|>\ntwo pages\n</state>\n"
+    )
+    assert (
+        render_image_state("", 1)
+        == "<state>\n<|vision_start|><|image_pad|><|vision_end|>\n</state>\n"
+    )
     assert render_image_state("text", 0) == "<state>\ntext\n</state>\n"
 
 
@@ -184,7 +238,9 @@ def test_checkpoint_tokenizer_reads_text(engines):
 
 def test_decode_accepts_only_promised_formats_and_sizes():
     assert decode_image(_png(Image.new("RGB", (32, 16)), "JPEG")).size == (32, 16)
-    eps = base64.b64encode(b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\nshowpage\n").decode()
+    eps = base64.b64encode(
+        b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\nshowpage\n"
+    ).decode()
     with pytest.raises(ValueError, match="could not be read"):
         decode_image(eps)
     with pytest.raises(ValueError, match="pixels"):
@@ -223,7 +279,9 @@ def test_adapter_lands_on_the_decoder_and_vision_is_frozen(engines):
 def test_text_requests_unchanged(engines):
     text, vision = engines
     req = SystemOneRequest(state=STATE, questions=QUESTIONS)
-    assert text.evaluate(req).model_dump()["answers"] == vision.evaluate(req).model_dump()["answers"]
+    assert (
+        text.evaluate(req).model_dump()["answers"] == vision.evaluate(req).model_dump()["answers"]
+    )
 
 
 def _reference(vision: VisionEngine, state: str, images: list[str], q) -> list[float]:
@@ -231,16 +289,28 @@ def _reference(vision: VisionEngine, state: str, images: list[str], q) -> list[f
     rq = render_question(q)
     pil = [fit_image(decode_image(b), 448) for b in images]
     proc = vision.image_processor(images=pil, return_tensors="pt")
-    counts = image_tokens_for_grid(proc["image_grid_thw"].tolist(), vision.image_processor.merge_size)
+    counts = image_tokens_for_grid(
+        proc["image_grid_thw"].tolist(), vision.image_processor.merge_size
+    )
     text = expand_image_tokens(render_image_state(state, len(images)), counts) + rq.text
     enc = vision.tok(text, return_offsets_mapping=True)
-    opt = _option_token_index(enc["offset_mapping"], rq.option_spans, len(text) - len(rq.text))
+    opt = option_token_index(enc["offset_mapping"], rq.option_spans, len(text) - len(rq.text))
     ids = torch.tensor([enc["input_ids"]])
     with torch.no_grad():
-        out = vision.model(ids, torch.ones_like(ids), torch.tensor([rq.n_slots]), opt_idx=torch.tensor([opt]),
-                           temperature=vision._temperatures([rq.kind]), pixel_values=proc["pixel_values"],
-                           image_grid_thw=proc["image_grid_thw"])
-    return masked_log_softmax(out["logits"], torch.tensor([rq.n_slots])).exp()[0, : rq.n_slots].tolist()
+        out = vision.model(
+            ids,
+            torch.ones_like(ids),
+            torch.tensor([rq.n_slots]),
+            opt_idx=torch.tensor([opt]),
+            temperature=vision._temperatures([rq.kind]),
+            pixel_values=proc["pixel_values"],
+            image_grid_thw=proc["image_grid_thw"],
+        )
+    return (
+        masked_log_softmax(out["logits"], torch.tensor([rq.n_slots]))
+        .exp()[0, : rq.n_slots]
+        .tolist()
+    )
 
 
 @pytest.mark.parametrize("sizes", [[(600, 800)], [(448, 448), (1000, 200)]])
@@ -287,15 +357,92 @@ def test_long_state_keeps_its_head_and_the_images(engines):
         eng = _small_window(vision, 700, strict=False)
         state = "First words stay. " + "filler " * 200 + "Last words go."
         img = [fit_image(decode_image(_b64(320, 320, 4)), 448)]
-        s, _, _ = eng._fit_images(state, img, [render_question(QUESTIONS["signed"]).text])
+        s, _, _, _ = eng._fit_images(state, img, [render_question(QUESTIONS["signed"]).text])
         assert s.count(eng.tok.convert_tokens_to_ids(IMAGE_PAD)) == 100  # the image is whole
         kept = eng.tok.decode(s)
         assert "First words stay." in kept and "Last words go." not in kept
         with pytest.raises(ValueError, match="context window"):
             _small_window(vision, 700, strict=True)._fit_images(
-                state, img, [render_question(QUESTIONS["signed"]).text])
+                state, img, [render_question(QUESTIONS["signed"]).text]
+            )
     finally:
         vision.model.config.max_length = original
+
+
+def test_concurrent_image_and_text_requests_match_serial(engines):
+    """Vision engine serves mixed image+text requests through FastAPI's threadpool.
+    `_fit_images` once wrote offsets onto the engine too; a concurrent request would
+    overwrite them before `_image_probs` read them back, so the pointer head scored
+    the wrong tokens. Pins that the image path threads offsets per request as the
+    text path does."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    _, vision = engines
+    img = _b64(160, 160, 7)
+    reqs = []
+    for i in range(8):
+        state = f"{STATE} ({i})"
+        if i % 2:
+            reqs.append(SystemOneRequest(state=state, questions=QUESTIONS, images=[img]))
+        else:
+            reqs.append(SystemOneRequest(state=state, questions=QUESTIONS))
+
+    def answers(resp):
+        return {n: a.model_dump() for n, a in resp.answers.items()}
+
+    with torch.inference_mode():
+        serial = [answers(vision.evaluate(r)) for r in reqs]
+
+    # Hold every thread between tokenising and pointing, so they interleave at the
+    # race-prone spot in both the text (_fit) and image (_fit_images) paths.
+    workers = 4
+    barrier = threading.Barrier(workers, timeout=60)
+    broke = threading.Event()
+    # The HF fast tokenizer (Rust) raises "Already borrowed" if two threads reconfigure
+    # truncation on it at once -- orthogonal to the race under test. Serialise just
+    # the tokeniser calls; the barrier still interleaves threads at the race-prone spot.
+    fit_lock = threading.Lock()
+
+    def _trip():
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            broke.set()
+        time.sleep(0.01)
+
+    fit = type(vision)._fit
+    fit_images = type(vision)._fit_images
+
+    def slow_fit(self, *a, **kw):
+        with fit_lock:
+            out = fit(self, *a, **kw)
+        _trip()
+        return out
+
+    def slow_fit_images(self, *a, **kw):
+        with fit_lock:
+            out = fit_images(self, *a, **kw)
+        _trip()
+        return out
+
+    try:
+        VisionEngine._fit = slow_fit  # type: ignore[method-assign]
+        VisionEngine._fit_images = slow_fit_images  # type: ignore[method-assign]
+
+        def run(r):
+            with torch.inference_mode():
+                return answers(vision.evaluate(r))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            concurrent = list(pool.map(run, reqs))
+    finally:
+        VisionEngine._fit = fit  # type: ignore[method-assign]
+        VisionEngine._fit_images = fit_images  # type: ignore[method-assign]
+
+    assert not broke.is_set(), "barrier broke; threads did not interleave at _fit/_fit_images"
+    assert concurrent == serial
 
 
 # ---- engine and API ------------------------------------------------------------------------
@@ -303,8 +450,11 @@ def test_long_state_keeps_its_head_and_the_images(engines):
 
 def test_image_only_request_and_refusals(engines):
     text, vision = engines
-    req = SystemOneRequest(state="", questions={"signed": QUESTIONS["signed"]},
-                           images=["data:image/png;base64," + _b64(320, 320, 2)])
+    req = SystemOneRequest(
+        state="",
+        questions={"signed": QUESTIONS["signed"]},
+        images=["data:image/png;base64," + _b64(320, 320, 2)],
+    )
     assert 0.0 <= vision.evaluate(req).answers["signed"].noul <= 1.0
     with pytest.raises(ValueError):
         text.evaluate(req)  # a text-only engine refuses images rather than ignore them
@@ -313,8 +463,9 @@ def test_image_only_request_and_refusals(engines):
 
 
 def test_load_vision_engine_keeps_the_server_settings(ckpt):
-    eng = load_vision_engine(ckpt, EngineConfig(device="cpu", strict_window=True, max_batch=3,
-                                                model_name="vd-test"))
+    eng = load_vision_engine(
+        ckpt, EngineConfig(device="cpu", strict_window=True, max_batch=3, model_name="vd-test")
+    )
     assert (eng.cfg.strict_window, eng.cfg.max_batch, eng.cfg.model_name) == (True, 3, "vd-test")
 
 
@@ -323,8 +474,11 @@ def test_server_routes_images(ckpt):
 
     from strands_decider import server
 
-    body = {"state": "Checkout page.", "images": [_b64(320, 320, 3)],
-            "questions": {"signed": {"type": "noul", "instructions": "Is the form signed?"}}}
+    body = {
+        "state": "Checkout page.",
+        "images": [_b64(320, 320, 3)],
+        "questions": {"signed": {"type": "noul", "instructions": "Is the form signed?"}},
+    }
     vision_app = TestClient(server.create_app(ckpt, device="cpu", vision=True))
     r = vision_app.post("/v1/systemone", json=body)
     assert r.status_code == 200, r.text

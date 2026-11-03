@@ -14,8 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from strands_decider import server
-from strands_decider.infer import _to_answer
-from strands_decider.prompting import render_question
+from strands_decider.prompting import render_question, to_answer
 from strands_decider.schema import (
     ChoiceQuestion,
     NoulQuestion,
@@ -34,7 +33,6 @@ class _StubCfg:
 
 class _StubModelCfg:
     base_model = "stub"
-    num_slots = 24
     temperature = 1.0
     max_length = 512
 
@@ -56,7 +54,7 @@ class _StubEngine:
             n = rq.n_slots
             # Concentrated on slot 0, so answers are deterministic and non-uniform.
             probs = [0.7] + [0.3 / (n - 1)] * (n - 1)
-            answers[name] = _to_answer(rq, probs)
+            answers[name] = to_answer(rq, probs)
         return SystemOneResponse(
             model=self.cfg.model_name,
             answers=answers,
@@ -102,10 +100,28 @@ def test_health_identifies_checkpoint(monkeypatch):
     monkeypatch.setattr(server, "_engine", None)
     monkeypatch.setattr(server.StrandsDeciderModel, "load", lambda *a, **k: _StubModel())
     monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _StubEngine())
-    r = TestClient(server.create_app("checkpoints/strands-decider-test", device="cpu")).get("/health")
+    r = TestClient(server.create_app("checkpoints/strands-decider-test", device="cpu")).get(
+        "/health"
+    )
     assert r.status_code == 200
     assert r.json()["checkpoint"] == "checkpoints/strands-decider-test"
     assert r.json()["max_length"] == 512
+
+
+def test_sagemaker_paths_alias_the_api(monkeypatch):
+    """SageMaker and AgentCore Runtime call GET /ping and POST /invocations; the real app
+    answers them as /health and /v1/systemone."""
+    monkeypatch.setattr(server, "_engine", None)
+    monkeypatch.setattr(server.StrandsDeciderModel, "load", lambda *a, **k: _StubModel())
+    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _StubEngine())
+    client = TestClient(server.create_app("checkpoints/strands-decider-test", device="cpu"))
+    assert client.get("/ping").json() == client.get("/health").json()
+    body = {"state": "x", "questions": {"q": {"type": "noul", "instructions": "Yes?"}}}
+    r = client.post("/invocations", json=body)
+    assert r.status_code == 200
+    assert r.json()["answers"] == client.post("/v1/systemone", json=body).json()["answers"]
+    bad = {"state": "x", "questions": {"q": {"type": "nope"}}}
+    assert client.post("/invocations", json=bad).status_code == 422
 
 
 def test_documented_payload_round_trips(client):
@@ -178,13 +194,13 @@ def test_score_answer_is_expected_value_not_argmax():
     """The API returns a continuous score, so a split belief must land between levels."""
     q = ScoreQuestion(instructions="x", criteria=["low", "mid", "high"])
     rq = render_question(q)
-    ans = _to_answer(rq, [0.0, 0.5, 0.5])
+    ans = to_answer(rq, [0.0, 0.5, 0.5])
     assert ans.score == pytest.approx(1.5)
 
 
 def test_noul_answer_carries_no_confidence_field():
     rq = render_question(NoulQuestion(instructions="is it?"))
-    ans = _to_answer(rq, [0.1, 0.9])
+    ans = to_answer(rq, [0.1, 0.9])
     assert ans.noul == pytest.approx(0.9)
     assert not hasattr(ans, "confidence")
 
@@ -192,7 +208,7 @@ def test_noul_answer_carries_no_confidence_field():
 def test_choice_answer_picks_argmax():
     q = ChoiceQuestion(instructions="x", criteria={"a": "", "b": "", "c": ""})
     rq = render_question(q)
-    ans = _to_answer(rq, [0.2, 0.5, 0.3])
+    ans = to_answer(rq, [0.2, 0.5, 0.3])
     assert ans.choice == "b"
     assert ans.confidence == pytest.approx((3 * 0.5 - 1) / 2)
 
@@ -206,7 +222,9 @@ def test_real_create_app_routes_work(monkeypatch):
     """
     from strands_decider import infer
 
-    monkeypatch.setattr(server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel()))
+    monkeypatch.setattr(
+        server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel())
+    )
     monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _StubEngine())
     monkeypatch.setattr(infer, "SystemOneEngine", lambda model, cfg=None: _StubEngine())
 
@@ -231,33 +249,41 @@ def test_real_create_app_routes_work(monkeypatch):
     assert "latency_ms" in body
 
 
-def test_concurrent_requests_do_not_enter_engine_in_parallel(monkeypatch):
-    """Tests concurrent requests."""
-    enter = threading.Event()
-    release = threading.Event()
-    inside = 0
-    peak = 0
-    lock = threading.Lock()
+def _racing_engine_cls():
+    """Engine stub that records peak concurrent entries into evaluate()."""
+    state = {
+        "enter": threading.Event(),
+        "release": threading.Event(),
+        "inside": 0,
+        "peak": 0,
+        "lock": threading.Lock(),
+    }
 
     class _RacingEngine(_StubEngine):
         def evaluate(self, request):
-            nonlocal inside, peak
-            with lock:
-                inside += 1
-                peak = max(peak, inside)
-            enter.set()
+            with state["lock"]:
+                state["inside"] += 1
+                state["peak"] = max(state["peak"], state["inside"])
+            state["enter"].set()
             # Hold inside the engine long enough that a second request can race in.
-            release.wait(timeout=2.0)
+            state["release"].wait(timeout=2.0)
             try:
                 return super().evaluate(request)
             finally:
-                with lock:
-                    inside -= 1
+                with state["lock"]:
+                    state["inside"] -= 1
 
-    monkeypatch.setattr(server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel()))
-    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _RacingEngine())
+    return _RacingEngine, state
 
-    app = server.create_app("checkpoints/does-not-exist", device="cpu")
+
+def _run_racing(monkeypatch, device):
+    EngineCls, state = _racing_engine_cls()
+    monkeypatch.setattr(
+        server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel())
+    )
+    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: EngineCls())
+
+    app = server.create_app("checkpoints/does-not-exist", device=device)
     client = TestClient(app)
     payload = {"state": "x", "questions": {"q": {"type": "noul", "instructions": "y"}}}
 
@@ -268,17 +294,32 @@ def test_concurrent_requests_do_not_enter_engine_in_parallel(monkeypatch):
         f1 = pool.submit(_post)
         # Only release once we have observed the first request inside the engine,
         # so the second request has a chance to race in while the first is held.
-        assert enter.wait(timeout=2.0), "first request never entered the engine"
+        assert state["enter"].wait(timeout=2.0), "first request never entered the engine"
         f2 = pool.submit(_post)
         # Give the second request a moment to reach evaluate() if nothing serialises it.
         threading.Event().wait(0.2)
-        release.set()
+        state["release"].set()
         r1, r2 = f1.result(timeout=5.0), f2.result(timeout=5.0)
 
     assert r1.status_code == 200 and r2.status_code == 200
+    return state["peak"]
+
+
+def test_mps_serialises_engine_calls(monkeypatch):
+    """MPS crashes on concurrent GPU calls (issue #9), so requests must take turns."""
+    peak = _run_racing(monkeypatch, device="mps")
     assert peak < 2, (
-        f"two requests entered the engine concurrently (peak={peak}); "
-        "GPU calls must be serialised to avoid the MPS crash"
+        f"two requests entered the engine concurrently on MPS (peak={peak}); "
+        "GPU calls must be serialised to avoid the Metal command-buffer crash"
+    )
+
+
+def test_cpu_allows_concurrent_engine_calls(monkeypatch):
+    """CPU (and CUDA) don't need serialisation; the lock would just block throughput."""
+    peak = _run_racing(monkeypatch, device="cpu")
+    assert peak == 2, (
+        f"CPU requests were serialised (peak={peak}); the lock should be lifted on "
+        "devices that tolerate overlapping engine calls"
     )
 
 
@@ -289,7 +330,9 @@ def test_too_many_options_returns_422(monkeypatch):
         def evaluate(self, request):
             raise ValueError("question has 30 options but this model has 24 slots")
 
-    monkeypatch.setattr(server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel()))
+    monkeypatch.setattr(
+        server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel())
+    )
     monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _NarrowEngine())
 
     app = server.create_app("checkpoints/does-not-exist", device="cpu")

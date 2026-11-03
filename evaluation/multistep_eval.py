@@ -7,19 +7,20 @@ guessing each claim's most common label scores 0.679 on it.
 
 Rows whose prompt exceeds the model's window are skipped, never truncated.
 
-    python evaluation/multistep_eval.py CHECKPOINT [--data data/multistep_v14_eval.jsonl]
+    python -m evaluation.multistep_eval CHECKPOINT [--data data/multistep_v14_eval.jsonl]
 """
+
 import argparse
 import json
 import warnings
 from collections import defaultdict
 
 warnings.filterwarnings("ignore")
-from strands_decider.data.format import load_examples  # noqa: E402
-from strands_decider.data.multistep import CANNOT  # noqa: E402
-from strands_decider.evaluate import collect_logits  # noqa: E402
 from strands_decider.modeling import StrandsDeciderModel  # noqa: E402
 from strands_decider.prompting import build_prompt  # noqa: E402
+from training.data.format import load_examples  # noqa: E402
+from training.data.multistep import CANNOT  # noqa: E402
+from training.evaluate import collect_logits  # noqa: E402
 
 
 def main():
@@ -31,8 +32,11 @@ def main():
 
     rows = load_examples([args.data])
     model = StrandsDeciderModel.load(args.checkpoint)
-    fits = [len(model.tokenizer(build_prompt(e.state, e.to_question())[0])["input_ids"])
-            <= model.config.max_length for e in rows]
+    fits = [
+        len(model.tokenizer(build_prompt(e.state, e.to_question())[0])["input_ids"])
+        <= model.config.max_length
+        for e in rows
+    ]
     keep = [e for e, f in zip(rows, fits, strict=True) if f]
     logits, *_ = collect_logits(model, keep, max_length=model.config.max_length, batch_size=4)
     preds = logits.argmax(-1).tolist()  # collect_logits masks the columns past each row's options

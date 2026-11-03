@@ -7,23 +7,29 @@ Compatibility with the Jev API itself is not verified.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
+from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
+from . import __version__
 from .infer import EngineConfig, SystemOneEngine, load_mlx
 from .modeling import StrandsDeciderModel
 from .schema import SystemOneRequest, SystemOneResponse
 
 _engine: SystemOneEngine | None = None
-# One engine call at a time. FastAPI dispatches sync handlers on a threadpool, so
-# without this two overlapping requests touch the same GPU and crash MPS with a
-# Metal command-buffer assertion (issue #9). Serialising here is cheap: the engine
-# already saturates the device within a single request.
 _engine_lock = threading.Lock()
+
+
+def _needs_serialisation(device: str) -> bool:
+    """MPS aborts the process with a Metal command-buffer assertion when two overlapping
+    threads hit the same device. CUDA and CPU are thread-safe for inference, and the MLX
+    engine runs every evaluation on a single worker thread."""
+    return str(device).startswith("mps")
 
 
 def get_engine() -> SystemOneEngine:
@@ -46,10 +52,22 @@ def create_app(
 ) -> FastAPI:
     global _engine
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            # The MLX engine owns a worker thread (see mlx_engine.MLXEngine); other engines
+            # have nothing to close.
+            close = getattr(_engine, "close", None)
+            if callable(close):
+                close()
+
     app = FastAPI(
         title="strands-decider System One",
-        version="0.1.0",
+        version=__version__,
         description="Typed, calibrated answers. Choice, Score and Noul over one state.",
+        lifespan=lifespan,
     )
 
     # Identify the response's `model` by the checkpoint served, so multiple servers
@@ -57,8 +75,12 @@ def create_app(
     resolved_name = model_name or os.path.basename(checkpoint.rstrip("/")) or checkpoint
 
     config = EngineConfig(
-        device=device, use_prefix_cache=use_prefix_cache, model_name=resolved_name,
-        strict_window=strict_window, max_batch=max_batch, max_batch_tokens=max_batch_tokens,
+        device=device,
+        use_prefix_cache=use_prefix_cache,
+        model_name=resolved_name,
+        strict_window=strict_window,
+        max_batch=max_batch,
+        max_batch_tokens=max_batch_tokens,
     )
     if vision:
         if device == "mlx":
@@ -72,7 +94,10 @@ def create_app(
         model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
         _engine = SystemOneEngine(model, config)
 
+    # SageMaker and AgentCore Runtime call /ping and /invocations; each is the same
+    # handler as the path above it.
     @app.get("/health")
+    @app.get("/ping")
     def health() -> dict:
         eng = get_engine()
         return {
@@ -80,7 +105,6 @@ def create_app(
             "model": eng.cfg.model_name,
             "checkpoint": checkpoint,
             "base_model": eng.model.config.base_model,
-            "num_slots": eng.model.config.num_slots,
             "max_length": eng.model.config.max_length,
             "temperature": eng.model.config.temperature,
             "device": eng.cfg.device,
@@ -88,15 +112,19 @@ def create_app(
             "vision": vision,
         }
 
+    guard: contextlib.AbstractContextManager
+    guard = _engine_lock if _needs_serialisation(device) else contextlib.nullcontext()
+
     @app.post("/v1/systemone", response_model=SystemOneResponse)
+    @app.post("/invocations", response_model=SystemOneResponse)
     def systemone(request: SystemOneRequest) -> JSONResponse:
         eng = get_engine()
         started = time.perf_counter()
         try:
-            with _engine_lock:
+            with guard:
                 response = eng.evaluate(request)
         except ValueError as exc:
-            # Option count over num_slots, malformed permutation, etc. -- caller error.
+            # Malformed permutation, etc. -- caller error.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         elapsed_ms = (time.perf_counter() - started) * 1000
         payload = response.model_dump()
